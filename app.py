@@ -4,11 +4,17 @@ import pandas as pd
 import numpy as np
 from sklearn.svm import SVR
 import sqlite3
+import time
 
 st.set_page_config(page_title="Autonomous Curve Agent", layout="wide")
 st.title("📈 Autonomous Curve Agent")
 
 DB_FILE = "predictor_database.db"
+
+# Cached data fetcher
+@st.cache_data(ttl=3600)
+def get_stock_data(ticker):
+    return yf.Ticker(ticker).history(start="2020-01-01", end="2026-06-19")
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -28,6 +34,7 @@ def update_past_actuals():
                 if not hist.empty:
                     actual = hist['Close'].iloc[0]
                     conn.execute(f"UPDATE {table} SET actual_price = ? WHERE rowid = ?", (actual, rowid))
+                    time.sleep(1.5) # Pace the requests to avoid being blocked
         except: continue
     conn.commit()
     conn.close()
@@ -42,49 +49,39 @@ if st.button("Run Autonomous Cycle"):
     else:
         update_past_actuals()
         try:
-            data = yf.Ticker(ticker).history(start="2020-01-01", end="2026-06-19")
+            data = get_stock_data(ticker)
             current_price = data['Close'].iloc[-1]
             
-            # 1. Calculate returns
+            # Adaptive Model Logic
             df = data[['Close']].copy()
             df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
             df = df.dropna()
             
-            # 2. Determine Lookback
             hist_vol = df['Log_Ret'].std()
             ideal_lookback = int(np.clip(100 / (hist_vol * 10), 50, 300))
             
-            # 3. STRICT SYNC: Slice the dataframe, then extract values
             df_sync = df.tail(ideal_lookback).copy()
             y = df_sync['Log_Ret'].values
             X = np.arange(len(y)).reshape(-1, 1)
             
-            # 4. Fit Model
             model = SVR(kernel='rbf', C=10, gamma='scale').fit(X, y)
             
-            # 5. Forecast
+            # Forecast Logic
             forecast_prices = []
             last_p = current_price
             conn = sqlite3.connect(DB_FILE)
-            
             for i in range(1, 6):
-                # Predict using the next index position
                 pred_return = model.predict(np.array([[len(y) + i - 1]]))[0]
                 last_p = last_p * np.exp(pred_return)
                 forecast_prices.append(last_p)
-                
                 target_date = str((pd.Timestamp.now() + pd.Timedelta(days=i)).date())
-                conn.execute("INSERT INTO forecasts VALUES (?, ?, ?, ?, ?)", 
-                             (ticker, i, float(last_p), 0.0, target_date))
-            
+                conn.execute("INSERT INTO forecasts VALUES (?, ?, ?, ?, ?)", (ticker, i, float(last_p), 0.0, target_date))
             conn.commit()
             conn.close()
             
             st.success(f"Forecast complete for {ticker}!")
             st.line_chart(pd.DataFrame(forecast_prices, columns=["Predicted Price"]))
-            
             for i, p in enumerate(forecast_prices):
                 st.write(f"Day {i+1}: **${p:.2f}**")
-                
         except Exception as e:
             st.error(f"Autonomous Error: {e}")
